@@ -89,6 +89,8 @@ class SessionStore(private val context: Context) {
     }.getOrDefault(mutableListOf())
     fun setLastPdf(uri: Uri) = p.edit().putString("lastUri", uri.toString()).apply()
     fun lastPdf(): Uri? = p.getString("lastUri", null)?.let(Uri::parse)
+    fun saveIconPosition(x:Int,y:Int) = p.edit().putInt("iconX",x).putInt("iconY",y).apply()
+    fun iconPosition():Pair<Int,Int> = p.getInt("iconX",16) to p.getInt("iconY",100)
     fun clearSession() = p.edit().remove("script").remove("session").remove("lastUri").apply()
     fun layout(): OverlayLayout {
         val raw=p.getString("layout",null) ?: return OverlayLayout()
@@ -337,6 +339,18 @@ class TimestampService:Service(){
     private var engineHi:VoskEngine?=null;private var engineEn:VoskEngine?=null;private var matcher:FuzzyMatcher?=null
     private var lines=mutableListOf<ScriptLine>()
     private val recording=AtomicBoolean(false)
+    private val projectionCallback=object:MediaProjection.Callback(){
+        override fun onStop(){
+            main.post{
+                stopRecording(showToast=false)
+                projection=null
+                remove(menu)
+                remove(guide)
+                remove(hi)
+                toast("Screen capture ended. Timestamps already recorded were kept.")
+            }
+        }
+    }
     private var startNs=0L
     private var visibleWords=emptyList<WordBox>()
     private var latestFrame:OcrFrame?=null
@@ -367,11 +381,15 @@ class TimestampService:Service(){
         } ?: run { toast("Screen capture permission data was not returned."); return }
         val mgr=getSystemService(MediaProjectionManager::class.java)
         projection=mgr.getMediaProjection(code,data)
+        projection?.registerCallback(projectionCallback,main)
         startForeground(NOTIF,notification("Ready"),ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         setupCapture()
     }
     private fun setupCapture(){val p=projection?:return;val dm=resources.displayMetrics;reader=ImageReader.newInstance(dm.widthPixels,dm.heightPixels,PixelFormat.RGBA_8888,2);reader!!.setOnImageAvailableListener({capture(it) },main);display=p.createVirtualDisplay("TimestampGenius",dm.widthPixels,dm.heightPixels,dm.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,reader!!.surface,null,main);ocr=OcrEngine()}
-    private fun showIcon(){if(icon?.parent!=null)return;val v=TextView(this).apply{text="TG";textSize=13f;gravity=Gravity.CENTER;setTextColor(Color.BLACK);setBackgroundColor(Color.YELLOW);setOnTouchListener(DragTouch());setOnClickListener{toggleMenu()}};icon=v;val p=WindowManager.LayoutParams(64,64,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=16;y=100};iconP=p;runCatching{wm.addView(v,p)}}
+    private fun showIcon(){if(icon?.parent!=null)return;val v=TextView(this).apply{text="TG";textSize=13f;gravity=Gravity.CENTER;setTextColor(Color.BLACK);setBackgroundColor(Color.YELLOW);setOnTouchListener(DragTouch());setOnClickListener{toggleMenu()}};icon=v;val p=WindowManager.LayoutParams(64,64,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START
+            x=store.iconPosition().first
+            y=store.iconPosition().second
+        };iconP=p;runCatching{wm.addView(v,p)}}
     private fun toggleMenu(){if(menu?.parent!=null){remove(menu);return};val l=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(8,8,8,8);setBackgroundColor(Color.WHITE);elevation=20f};btn(l,"START"){startRecording();remove(menu)};btn(l,"STOP"){stopRecording();remove(menu)};btn(l,"SAVE"){savePdf();remove(menu)};btn(l,"SET LINES"){setLines();remove(menu)};val p=WindowManager.LayoutParams(240,-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=(iconP?.x?:16)+72;y=iconP?.y?:100};menu=l;runCatching{wm.addView(l,p)}}
     private fun setLines(){
         if(recording.get()){toast("Stop recording before editing the line layout.");return}
@@ -516,15 +534,29 @@ class TimestampService:Service(){
         return hit.toFloat()/max(x.size,y.size).toFloat()
     }
     private fun imageBitmap(i:Image):Bitmap?{val pl=i.planes.firstOrNull()?:return null;val ps=pl.pixelStride;val row=pl.rowStride;val pad=row-ps*i.width;val tmp=Bitmap.createBitmap(i.width+pad/ps,i.height,Bitmap.Config.ARGB_8888);pl.buffer.rewind();tmp.copyPixelsFromBuffer(pl.buffer);return if(pad==0)tmp else Bitmap.createBitmap(tmp,0,0,i.width,i.height).also{tmp.recycle()}}
-    private fun stopRecording(){recording.set(false);main.removeCallbacks(scrollRunnable);runCatching{audio?.stop()};audio?.release();audio=null;engineHi?.close();engineHi=null;engineEn?.close();engineEn=null;store.saveLines(lines);toast("Stopped. Timestamps are retained.")}
-    private fun savePdf(){if(recording.get())stopRecording();val out=if(lines.isNotEmpty())lines else store.loadLines();if(out.isEmpty()){toast("No timestamps recorded yet.");return};val name="ScriptTimestamps_"+SimpleDateFormat("yyyy-MM-dd_HH-mm",Locale.US).format(Date())+".pdf";val v=ContentValues().apply{put(MediaStore.Downloads.DISPLAY_NAME,name);put(MediaStore.Downloads.MIME_TYPE,"application/pdf");put(MediaStore.Downloads.RELATIVE_PATH,"Download/ScriptTimestamper")};val uri=contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,v)?:run{toast("Could not create the PDF.");return};runCatching{contentResolver.openOutputStream(uri)!!.use{PdfWriter.write(out,it)};store.setLastPdf(uri);toast("Saved "+name+" in Downloads/ScriptTimestamper")}.onFailure{contentResolver.delete(uri,null,null);toast("PDF save failed: "+(it.message?: "unknown error"))}}
+    private fun stopRecording(showToast:Boolean=true){recording.set(false);main.removeCallbacks(scrollRunnable);runCatching{audio?.stop()};audio?.release();audio=null;engineHi?.close();engineHi=null;engineEn?.close();engineEn=null;store.saveLines(lines);if(showToast)toast("Stopped. Timestamps are retained.")}
+    private fun savePdf(){if(recording.get())stopRecording();val out=if(lines.isNotEmpty())lines else store.loadLines();if(out.isEmpty()){toast("No timestamps recorded yet.");return};val name="ScriptTimestamps_"+SimpleDateFormat("yyyy-MM-dd_HH-mm",Locale.US).format(Date())+".pdf";val v=ContentValues().apply{
+                put(MediaStore.Downloads.DISPLAY_NAME,name)
+                put(MediaStore.Downloads.MIME_TYPE,"application/pdf")
+                put(MediaStore.Downloads.RELATIVE_PATH,"Download/ScriptTimestamper")
+                put(MediaStore.Downloads.IS_PENDING,1)
+            };val uri=contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,v)?:run{toast("Could not create the PDF.");return};runCatching{
+                contentResolver.openOutputStream(uri)!!.use{PdfWriter.write(out,it)}
+                contentResolver.update(uri,ContentValues().apply{put(MediaStore.Downloads.IS_PENDING,0)},null,null)
+                store.setLastPdf(uri)
+                toast("Saved "+name+" in Downloads/ScriptTimestamper")
+            }.onFailure{
+                contentResolver.delete(uri,null,null)
+                toast("PDF save failed: "+(it.message?: "unknown error"))
+            }}
     private fun btn(l:LinearLayout,s:String,click:()->Unit){l.addView(Button(this).apply{text=s;setTextColor(Color.BLACK);setBackgroundColor(Color.WHITE);setOnClickListener{click()}})}
     private fun remove(v:View?){if(v!=null&&v.parent!=null)runCatching{wm.removeView(v)}}
     private fun toast(s:String){main.post{Toast.makeText(this,s,Toast.LENGTH_LONG).show()}}
     private fun notificationChannel(){if(Build.VERSION.SDK_INT>=26)getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("tg","Timestamp Genius",NotificationManager.IMPORTANCE_LOW))}
     private fun notification(s:String)=androidx.core.app.NotificationCompat.Builder(this,"tg").setSmallIcon(android.R.drawable.ic_menu_recent_history).setContentTitle("Timestamp Genius").setContentText(s).setOngoing(true).build()
-    private inner class DragTouch:View.OnTouchListener{var x=0f;var y=0f;var moved=false;override fun onTouch(v:View,e:MotionEvent):Boolean{val p=iconP?:return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{x=e.rawX;y=e.rawY;moved=false;return false};MotionEvent.ACTION_MOVE->{val dx=e.rawX-x;val dy=e.rawY-y;if(abs(dx)>4||abs(dy)>4)moved=true;p.x+=dx.toInt();p.y=max(0,p.y+dy.toInt());runCatching{wm.updateViewLayout(icon,p)};x=e.rawX;y=e.rawY;return true};MotionEvent.ACTION_UP->return moved};return false}}
-    override fun onDestroy(){recording.set(false);main.removeCallbacks(scrollRunnable);speechBacklog.clear();runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.stop()};remove(icon);remove(menu);remove(guide);remove(hi);main.removeCallbacksAndMessages(null);super.onDestroy()}
+    private inner class DragTouch:View.OnTouchListener{var x=0f;var y=0f;var moved=false;override fun onTouch(v:View,e:MotionEvent):Boolean{val p=iconP?:return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{x=e.rawX;y=e.rawY;moved=false;return false};MotionEvent.ACTION_MOVE->{val dx=e.rawX-x;val dy=e.rawY-y;if(abs(dx)>4||abs(dy)>4)moved=true;p.x+=dx.toInt();p.y=max(0,p.y+dy.toInt());runCatching{wm.updateViewLayout(icon,p)};x=e.rawX;y=e.rawY;return true};MotionEvent.ACTION_UP->{if(moved)store.saveIconPosition(p.x,p.y);return moved}};return false}}
+    override fun onDestroy(){recording.set(false);main.removeCallbacks(scrollRunnable);speechBacklog.clear();runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.unregisterCallback(projectionCallback)}
+        runCatching{projection?.stop()};remove(icon);remove(menu);remove(guide);remove(hi);main.removeCallbacksAndMessages(null);super.onDestroy()}
 }
 
 object PdfWriter {
