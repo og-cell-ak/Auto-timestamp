@@ -307,10 +307,13 @@ class GuideView(c:Context):View(c){
     }
 
     override fun onDraw(c:Canvas){val x=m.x.toFloat();val y=m.y.toFloat();val w=m.width.toFloat();val h=m.height.toFloat();c.drawRoundRect(x,y,x+w,y+h,12f,12f,fill);c.drawRoundRect(x,y,x+w,y+h,12f,12f,border);var cy=y;val total=m.lines.sumOf{it.heightFraction.coerceAtLeast(.04f).toDouble()}.toFloat();m.lines.forEachIndexed{i,q->val hh=h*(q.heightFraction.coerceAtLeast(.04f)/total);val rect=RectF(x,cy,x+w*q.widthFraction.coerceIn(.35f,1f),cy+hh);c.drawRoundRect(rect,q.cornerRadius,q.cornerRadius,line);if(edit&&i==selected)c.drawCircle(rect.right,rect.bottom,12f,handle);cy+=hh}}
-    override fun onTouchEvent(e:MotionEvent):Boolean{if(!edit)return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{lx=e.rawX;ly=e.rawY;mode=hit(e.rawX,e.rawY);return true};MotionEvent.ACTION_MOVE->{val dx=e.rawX-lx;val dy=e.rawY-ly;lx=e.rawX;ly=e.rawY;when(mode){1->{m.x+=dx.toInt();m.y+=dy.toInt()};2->{m.width=max(280,m.width+dx.toInt())};3->{m.height=max(180,m.height+dy.toInt())};4->{val q=m.lines[selected];q.heightFraction=(q.heightFraction+dy/1200f).coerceIn(.04f,.8f);q.widthFraction=(q.widthFraction+dx/1600f).coerceIn(.35f,1f)}};invalidate();return true}};return true}
+    override fun onTouchEvent(e:MotionEvent):Boolean{if(!edit)return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{lx=e.rawX;ly=e.rawY;mode=hit(e.rawX,e.rawY);return true};MotionEvent.ACTION_MOVE->{val dx=e.rawX-lx;val dy=e.rawY-ly;lx=e.rawX;ly=e.rawY;when(mode){1->{m.x+=dx.toInt();m.y+=dy.toInt()};2->{m.width=max(280,m.width+dx.toInt())};3->{m.height=max(180,m.height+dy.toInt())};4->{val q=m.lines[selected];q.heightFraction=(q.heightFraction+dy/1200f).coerceIn(.04f,.8f);q.widthFraction=(q.widthFraction+dx/1600f).coerceIn(.35f,1f)};5->{m.width=max(280,m.width+dx.toInt());m.height=max(180,m.height+dy.toInt())}};invalidate();return true}};return true}
     private fun hit(px:Float,py:Float):Int{
         val x=m.x.toFloat(); val y=m.y.toFloat(); val r=x+m.width; val b=y+m.height
         if(px !in x..r || py !in y..b) return 0
+        if(kotlin.math.abs(px-r)<30f && kotlin.math.abs(py-b)<30f) return 5
+        if(kotlin.math.abs(px-r)<30f) return 2
+        if(kotlin.math.abs(py-b)<30f) return 3
         var cy=y
         val total=m.lines.sumOf{it.heightFraction.coerceAtLeast(.04f).toDouble()}.toFloat()
         for(i in m.lines.indices){
@@ -370,13 +373,23 @@ class TimestampService:Service(){
     private fun setupCapture(){val p=projection?:return;val dm=resources.displayMetrics;reader=ImageReader.newInstance(dm.widthPixels,dm.heightPixels,PixelFormat.RGBA_8888,2);reader!!.setOnImageAvailableListener({capture(it) },main);display=p.createVirtualDisplay("TimestampGenius",dm.widthPixels,dm.heightPixels,dm.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,reader!!.surface,null,main);ocr=OcrEngine()}
     private fun showIcon(){if(icon?.parent!=null)return;val v=TextView(this).apply{text="TG";textSize=13f;gravity=Gravity.CENTER;setTextColor(Color.BLACK);setBackgroundColor(Color.YELLOW);setOnTouchListener(DragTouch());setOnClickListener{toggleMenu()}};icon=v;val p=WindowManager.LayoutParams(64,64,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=16;y=100};iconP=p;runCatching{wm.addView(v,p)}}
     private fun toggleMenu(){if(menu?.parent!=null){remove(menu);return};val l=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(8,8,8,8);setBackgroundColor(Color.WHITE);elevation=20f};btn(l,"START"){startRecording();remove(menu)};btn(l,"STOP"){stopRecording();remove(menu)};btn(l,"SAVE"){savePdf();remove(menu)};btn(l,"SET LINES"){setLines();remove(menu)};val p=WindowManager.LayoutParams(240,-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=(iconP?.x?:16)+72;y=iconP?.y?:100};menu=l;runCatching{wm.addView(l,p)}}
-    private fun setLines(){val gv=GuideView(this).apply{m=store.layout();edit=true};guide=gv;val gp=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START};runCatching{wm.addView(gv,gp)};val p=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL;setPadding(8,8,8,8);setBackgroundColor(Color.WHITE)};btn(p,"−"){adjust(gv,-1)};btn(p,"+"){adjust(gv,1)};btn(p,"LOCK"){toggleLock(gv)};btn(p,"CORNER +"){val q=gv.m.lines[gv.selected];q.cornerRadius=(q.cornerRadius+4).coerceAtMost(40f);gv.invalidate()};btn(p,"SCROLL "+gv.m.scrollSpeed){gv.m.scrollSpeed=(gv.m.scrollSpeed+1)%10;(p.getChildAt(4)as Button).text="SCROLL "+gv.m.scrollSpeed};btn(p,"SAVE LAYOUT"){store.saveLayout(gv.m);remove(gv);remove(p)};btn(p,"CLOSE"){remove(gv);remove(p)};val pp=WindowManager.LayoutParams(-2,-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.CENTER_HORIZONTAL;y=10};runCatching{wm.addView(p,pp)}}
+    private fun setLines(){
+        if(recording.get()){toast("Stop recording before editing the line layout.");return}
+        val gv=GuideView(this).apply{m=store.layout();edit=true};guide=gv;val gp=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START};runCatching{wm.addView(gv,gp)};val p=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL;setPadding(8,8,8,8);setBackgroundColor(Color.WHITE)};btn(p,"−"){adjust(gv,-1)};btn(p,"+"){adjust(gv,1)};btn(p,"LOCK"){toggleLock(gv)};btn(p,"CORNER +"){val q=gv.m.lines[gv.selected];q.cornerRadius=(q.cornerRadius+4).coerceAtMost(40f);gv.invalidate()};btn(p,"SCROLL "+gv.m.scrollSpeed){gv.m.scrollSpeed=(gv.m.scrollSpeed+1)%10;(p.getChildAt(4)as Button).text="SCROLL "+gv.m.scrollSpeed};btn(p,"SAVE LAYOUT"){store.saveLayout(gv.m);remove(gv);remove(p)};btn(p,"CLOSE"){remove(gv);remove(p)};val pp=WindowManager.LayoutParams(-2,-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.CENTER_HORIZONTAL;y=10};runCatching{wm.addView(p,pp)}}
     private fun adjust(g:GuideView,d:Int){val n=(g.m.lineCount+d).coerceIn(1,20);g.m.lineCount=n;while(g.m.lines.size<n)g.m.lines.add(LineLayout());while(g.m.lines.size>n)g.m.lines.removeAt(g.m.lines.lastIndex);val q=1f/n;g.m.lines.forEach{if(!it.unlocked)it.heightFraction=q};g.invalidate()}
     private fun toggleLock(g:GuideView){val i=g.selected;g.m.lines[i].unlocked=!g.m.lines[i].unlocked;g.invalidate()}
     private fun startRecording(){if(recording.get())return;if(Build.VERSION.SDK_INT<29){toast("Device audio capture needs Android 10 or newer.");return};val p=projection?:run{toast("Press START on the main screen first.");return};lines=store.loadScript().mapIndexed{i,s->ScriptLine(i,s)}.toMutableList()
         if(lines.isEmpty())lines=store.loadLines()
         screenMode=lines.isEmpty()
-        matcher=if(lines.isEmpty())null else FuzzyMatcher{lines.map{it.text}}startNs=System.nanoTime();recording.set(true);ensureRuntimeOverlays();main.post(scrollRunnable);val sr=16000;val minb=AudioRecord.getMinBufferSize(sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(8192);val cfg=AudioPlaybackCaptureConfiguration.Builder(p).addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME).addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build();audio=runCatching{AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()).setBufferSizeInBytes(minb*2).setAudioPlaybackCaptureConfig(cfg).build()}.getOrNull();if(audio==null){recording.set(false);toast("The source app blocked playback capture.");return};engineHi=VoskEngine(this,"vosk-hi").takeIf{it.start()};engineEn=VoskEngine(this,"vosk-en").takeIf{it.start()};if(engineHi==null&&engineEn==null){recording.set(false);toast("Offline speech model could not start.");return};audio!!.startRecording();audioThread=Thread{val buf=ByteArray(minb);while(recording.get()){val n=runCatching{audio!!.read(buf,0,buf.size)}.getOrDefault(0);if(n>0){val hy=buildList{engineHi?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)
+        matcher=if(lines.isEmpty())null else FuzzyMatcher{lines.map{it.text}}startNs=System.nanoTime();recording.set(true);ensureRuntimeOverlays();main.post(scrollRunnable);val sr=16000;val minb=AudioRecord.getMinBufferSize(sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(8192);val cfg=AudioPlaybackCaptureConfiguration.Builder(p).addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME).addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build();audio=runCatching{AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()).setBufferSizeInBytes(minb*2).setAudioPlaybackCaptureConfig(cfg).build()}.getOrNull();if(audio==null){recording.set(false);toast("The source app blocked playback capture.");return};engineHi=VoskEngine(this,"vosk-hi").takeIf{it.start()};engineEn=VoskEngine(this,"vosk-en").takeIf{it.start()};if(engineHi==null&&engineEn==null){recording.set(false);toast("Offline speech model could not start.");return};val started=runCatching{audio!!.startRecording();audio!!.recordingState==AudioRecord.RECORDSTATE_RECORDING}.getOrDefault(false)
+        if(!started){
+            recording.set(false)
+            runCatching{audio?.release()}
+            audio=null
+            toast("The source app blocked playback audio capture.")
+            return
+        }
+        audioThread=Thread{val buf=ByteArray(minb);while(recording.get()){val n=runCatching{audio!!.read(buf,0,buf.size)}.getOrDefault(0);if(n>0){val hy=buildList{engineHi?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)
                                     engineEn?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)};val best=hy.maxByOrNull{score(lines.getOrNull(matcher?.current?:0)?.text.orEmpty(),it.text)}
                                 if(best!=null)handleSpeech(best)}}}.apply{start()} }
     private fun handleSpeech(s:SpeechResult){
@@ -623,13 +636,19 @@ class MainActivity:ComponentActivity(){
                 "Script-aware timestamps from device audio + screen/PDF",
                 color=ComposeColor.DarkGray
             )
+            val plainButtonColors=ButtonDefaults.buttonColors(
+                containerColor=ComposeColor.White,
+                contentColor=ComposeColor.Black
+            )
             Button(
                 onClick={picker.launch(arrayOf("application/pdf"))},
-                modifier=Modifier.fillMaxWidth()
+                modifier=Modifier.fillMaxWidth(),
+                colors=plainButtonColors
             ){Text("UPLOAD PDF")}
             Button(
                 onClick={::start},
-                modifier=Modifier.fillMaxWidth()
+                modifier=Modifier.fillMaxWidth(),
+                colors=plainButtonColors
             ){Text("START")}
             Button(
                 onClick={
@@ -648,11 +667,13 @@ class MainActivity:ComponentActivity(){
                         }
                     }
                 },
-                modifier=Modifier.fillMaxWidth()
+                modifier=Modifier.fillMaxWidth(),
+                colors=plainButtonColors
             ){Text("LAST PDF RECORDED")}
             Button(
                 onClick={confirm=true},
-                modifier=Modifier.fillMaxWidth()
+                modifier=Modifier.fillMaxWidth(),
+                colors=plainButtonColors
             ){Text("NEW SESSION")}
 
             if(script.isNotEmpty()){
