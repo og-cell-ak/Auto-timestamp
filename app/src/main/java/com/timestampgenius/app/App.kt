@@ -121,7 +121,8 @@ class FuzzyMatcher(private val source:()->List<String>) {
         if(tokens.isEmpty())return MatchEvent(progress=progress)
 
         if(result.isFinal){
-            committed+=tokens
+            val merged=mergeHypothesis(partial,tokens)
+            committed+=merged
             partial=emptyList()
         }else{
             partial=tokens
@@ -181,6 +182,26 @@ class FuzzyMatcher(private val source:()->List<String>) {
             }
         }
         return best
+    }
+
+    private fun mergeHypothesis(previous:List<String>,next:List<String>):List<String>{
+        if(previous.isEmpty())return next
+        if(next.isEmpty())return previous
+        if(next.size>=previous.size && previous.indices.all{similar(previous[it],next[it])}){
+            return next
+        }
+        if(previous.size>=next.size && next.indices.all{similar(previous[previous.size-next.size+it],next[it])}){
+            return previous
+        }
+        val maxOverlap=minOf(previous.size,next.size)
+        for(size in maxOverlap downTo 1){
+            val a=previous.takeLast(size)
+            val b=next.take(size)
+            if(a.indices.all{similar(a[it],b[it])}){
+                return previous+(next.drop(size))
+            }
+        }
+        return previous+next
     }
 
     private fun orderedProgress(expected:List<String>,candidate:List<String>):Int{
