@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.*
 import android.content.*
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.graphics.pdf.PdfRenderer
 import android.hardware.display.DisplayManager
@@ -206,7 +207,19 @@ class GuideView(c:Context):View(c){
     private var mode=0;private var lx=0f;private var ly=0f
     override fun onDraw(c:Canvas){val x=m.x.toFloat();val y=m.y.toFloat();val w=m.width.toFloat();val h=m.height.toFloat();c.drawRoundRect(x,y,x+w,y+h,12f,12f,fill);c.drawRoundRect(x,y,x+w,y+h,12f,12f,border);var cy=y;val total=m.lines.sumOf{it.heightFraction.coerceAtLeast(.04f).toDouble()}.toFloat();m.lines.forEachIndexed{i,q->val hh=h*(q.heightFraction.coerceAtLeast(.04f)/total);val rect=RectF(x,cy,x+w*q.widthFraction.coerceIn(.35f,1f),cy+hh);c.drawRoundRect(rect,q.cornerRadius,q.cornerRadius,line);if(edit&&i==selected)c.drawCircle(rect.right,rect.bottom,12f,handle);cy+=hh}}
     override fun onTouchEvent(e:MotionEvent):Boolean{if(!edit)return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{lx=e.rawX;ly=e.rawY;mode=hit(e.rawX,e.rawY);return true};MotionEvent.ACTION_MOVE->{val dx=e.rawX-lx;val dy=e.rawY-ly;lx=e.rawX;ly=e.rawY;when(mode){1->{m.x+=dx.toInt();m.y+=dy.toInt()};2->{m.width=max(280,m.width+dx.toInt())};3->{m.height=max(180,m.height+dy.toInt())};4->{val q=m.lines[selected];q.heightFraction=(q.heightFraction+dy/1200f).coerceIn(.04f,.8f);q.widthFraction=(q.widthFraction+dx/1600f).coerceIn(.35f,1f)}};invalidate();return true}};return true}
-    private fun hit(px:Float,py:Float):Int{val x=m.x.toFloat();val y=m.y.toFloat();val r=x+m.width;val b=y+m.height;if(px in x..r&&py in y..b){var cy=y;val total=m.lines.sumOf{it.heightFraction.coerceAtLeast(.04f).toDouble()}.toFloat();m.lines.forEachIndexed{i,q->{val hh=m.height*(q.heightFraction.coerceAtLeast(.04f)/total);if(py in cy..cy+hh){selected=i;return 4};cy+=hh}};return 1};return 0}
+    private fun hit(px:Float,py:Float):Int{
+        val x=m.x.toFloat(); val y=m.y.toFloat(); val r=x+m.width; val b=y+m.height
+        if(px !in x..r || py !in y..b) return 0
+        var cy=y
+        val total=m.lines.sumOf{it.heightFraction.coerceAtLeast(.04f).toDouble()}.toFloat()
+        for(i in m.lines.indices){
+            val q=m.lines[i]
+            val hh=m.height*(q.heightFraction.coerceAtLeast(.04f)/total)
+            if(py in cy..cy+hh){ selected=i; return 4 }
+            cy+=hh
+        }
+        return 1
+    }
 }
 
 class HighlightView(c:Context):View(c){var rects:List<RectF> = emptyList();private val p=Paint(3).apply{style=Paint.Style.FILL;color=0xAAFFD600.toInt()};override fun onDraw(c:Canvas){rects.forEach{c.drawRoundRect(it,5f,5f,p)}}}
@@ -221,7 +234,21 @@ class TimestampService:Service(){
     private var lines=mutableListOf<ScriptLine>();private val recording=AtomicBoolean(false);private var startNs=0L;private var visibleWords=emptyList<WordBox>()
     override fun onCreate(){super.onCreate();store=SessionStore(this);wm=getSystemService(WINDOW_SERVICE) as WindowManager;notificationChannel();lines=store.loadScript().mapIndexed{i,s->ScriptLine(i,s)}.toMutableList();showIcon()}
     override fun onStartCommand(i:Intent?,f:Int,id:Int):Int{when(i?.action){PREPARE->prepare(i);START->startRecording();STOP->stopRecording();SAVE->savePdf();SET->setLines()};return START_STICKY}
-    private fun prepare(i:Intent){if(projection!=null)return;val code=i.getIntExtra(CODE,Activity.RESULT_CANCELED);val data=if(Build.VERSION.SDK_INT>=33)i.getParcelableExtra(DATA,Intent::class.java) else @Suppress("DEPRECATION") i.getParcelableExtra(DATA) ?: return;val mgr=getSystemService(MediaProjectionManager::class.java);projection=mgr.getMediaProjection(code,data);startForeground(NOTIF,notification("Ready"),ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);setupCapture()}
+    override fun onBind(intent:Intent?):IBinder? = null
+    private fun prepare(i:Intent){
+        if(projection!=null) return
+        val code=i.getIntExtra(CODE,Activity.RESULT_CANCELED)
+        val data:Intent = if(Build.VERSION.SDK_INT>=33) {
+            i.getParcelableExtra(DATA,Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            i.getParcelableExtra(DATA)
+        } ?: run { toast("Screen capture permission data was not returned."); return }
+        val mgr=getSystemService(MediaProjectionManager::class.java)
+        projection=mgr.getMediaProjection(code,data)
+        startForeground(NOTIF,notification("Ready"),ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        setupCapture()
+    }
     private fun setupCapture(){val p=projection?:return;val dm=resources.displayMetrics;reader=ImageReader.newInstance(dm.widthPixels,dm.heightPixels,PixelFormat.RGBA_8888,2);reader!!.setOnImageAvailableListener({capture(it) },main);display=p.createVirtualDisplay("TimestampGenius",dm.widthPixels,dm.heightPixels,dm.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,reader!!.surface,null,main);ocr=OcrEngine()}
     private fun showIcon(){if(icon?.parent!=null)return;val v=TextView(this).apply{text="TG";textSize=13f;gravity=Gravity.CENTER;setTextColor(Color.BLACK);setBackgroundColor(Color.YELLOW);setOnTouchListener(DragTouch());setOnClickListener{toggleMenu()}};icon=v;val p=WindowManager.LayoutParams(64,64,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=16;y=100};iconP=p;runCatching{wm.addView(v,p)}}
     private fun toggleMenu(){if(menu?.parent!=null){remove(menu);return};val l=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(8,8,8,8);setBackgroundColor(Color.WHITE);elevation=20f};btn(l,"START"){startRecording();remove(menu)};btn(l,"STOP"){stopRecording();remove(menu)};btn(l,"SAVE"){savePdf();remove(menu)};btn(l,"SET LINES"){setLines();remove(menu)};val p=WindowManager.LayoutParams(240,-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=(iconP?.x?:16)+72;y=iconP?.y?:100};menu=l;runCatching{wm.addView(l,p)}}
@@ -261,23 +288,170 @@ object PdfWriter {
 
 class MainActivity:ComponentActivity(){
     private val store by lazy{SessionStore(this)}
-    private val notifyLauncher=registerForActivityResult(ActivityResultContracts.RequestPermission()){}
-    private val projectionLauncher=registerForActivityResult(ActivityResultContracts.StartActivityForResult()){r->if(r.resultCode==RESULT_OK&&r.data!=null){val i=Intent(this,TimestampService::class.java).apply{action=TimestampService.PREPARE;putExtra(TimestampService.CODE,r.resultCode);putExtra(TimestampService.DATA,r.data)};ContextCompat.startForegroundService(this,i)}}
-    override fun onCreate(b:Bundle?){super.onCreate(b);setContent{AppUi()}}
-    @Composable private fun AppUi(){
-        val scope=rememberCoroutineScope();var script by remember{mutableStateOf(store.loadScript())};var msg by remember{mutableStateOf<String?>(null)};var confirm by remember{mutableStateOf(false)}
-        val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->if(uri!=null)scope.launch(Dispatchers.IO){val r=PdfScriptParser.parse(this@MainActivity,uri);withContext(Dispatchers.Main){r.onSuccess{script=it;store.saveScript(it);msg="PDF loaded: "+it.size+" timestamp lines detected."}.onFailure{msg=it.message?: "Could not read PDF."}}}}
-        fun start(){if(Build.VERSION.SDK_INT>=23&&!Settings.canDrawOverlays(this@MainActivity)){startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:"+packageName)));msg="Allow Display over other apps, then press START again.";return};if(Build.VERSION.SDK_INT>=33)notifyLauncher.launch(Manifest.permission.POST_NOTIFICATIONS);val m=getSystemService(MediaProjectionManager::class.java);projectionLauncher.launch(m.createScreenCaptureIntent())}
-        Column(Modifier.fillMaxSize().padding(24.dp),verticalArrangement=Arrangement.spacedBy(16.dp)){
-            Text("Timestamp Genius",style=MaterialTheme.typography.headlineMedium,color=ComposeColor.Black)
-            Text("Script-aware timestamps from device audio + screen/PDF",color=ComposeColor.DarkGray)
-            Button({picker.launch(arrayOf("application/pdf"))},Modifier.fillMaxWidth()){Text("UPLOAD PDF")}
-            Button({start()},Modifier.fillMaxWidth()){Text("START")}
-            Button({store.lastPdf()?.let{runCatching{startActivity(Intent(Intent.ACTION_VIEW,it).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))}.onFailure{msg="Cannot open the last PDF."}}?:run{msg="No PDF recorded yet"}},Modifier.fillMaxWidth()){Text("LAST PDF RECORDED")}
-            Button({confirm=true},Modifier.fillMaxWidth()){Text("NEW SESSION")}
-            if(script.isNotEmpty()){Text("Loaded script: "+script.size+" lines",style=MaterialTheme.typography.titleMedium);LazyColumn(Modifier.weight(1f)){items(script){Text(it,color=ComposeColor.Black)}}}else Spacer(Modifier.weight(1f))
+
+    private val notifyLauncher=registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ){ launchProjection() }
+
+    private val projectionLauncher=registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ){ result ->
+        val data=result.data
+        if(result.resultCode==RESULT_OK && data!=null){
+            val intent=Intent(this,TimestampService::class.java).apply{
+                action=TimestampService.PREPARE
+                putExtra(TimestampService.CODE,result.resultCode)
+                putExtra(TimestampService.DATA,data)
+            }
+            ContextCompat.startForegroundService(this,intent)
+        }else{
+            Toast.makeText(this,"Screen capture permission was cancelled.",Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onCreate(b:Bundle?){
+        super.onCreate(b)
+        setContent{AppUi()}
+    }
+
+    private fun launchProjection(){
+        val manager=getSystemService(MediaProjectionManager::class.java)
+        projectionLauncher.launch(manager.createScreenCaptureIntent())
+    }
+
+    @Composable
+    private fun AppUi(){
+        val scope=rememberCoroutineScope()
+        var script by remember{mutableStateOf(store.loadScript())}
+        var msg by remember{mutableStateOf<String?>(null)}
+        var confirm by remember{mutableStateOf(false)}
+
+        val picker=rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ){ uri ->
+            if(uri!=null){
+                scope.launch(Dispatchers.IO){
+                    val result=PdfScriptParser.parse(this@MainActivity,uri)
+                    withContext(Dispatchers.Main){
+                        result.onSuccess{
+                            script=it
+                            store.saveScript(it)
+                            msg="PDF loaded: "+it.size+" timestamp lines detected."
+                        }.onFailure{
+                            msg=it.message ?: "Could not read PDF."
+                        }
+                    }
+                }
+            }
+        }
+
+        fun start(){
+            if(Build.VERSION.SDK_INT>=23 && !Settings.canDrawOverlays(this@MainActivity)){
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:"+packageName)
+                    )
+                )
+                msg="Allow Display over other apps, then press START again."
+                return
+            }
+
+            if(Build.VERSION.SDK_INT>=33 &&
+                ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.POST_NOTIFICATIONS
+                )!=PackageManager.PERMISSION_GRANTED
+            ){
+                notifyLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }else{
+                launchProjection()
+            }
+        }
+
+        Column(
+            Modifier.fillMaxSize().padding(24.dp),
+            verticalArrangement=Arrangement.spacedBy(16.dp)
+        ){
+            Text(
+                "Timestamp Genius",
+                style=MaterialTheme.typography.headlineMedium,
+                color=ComposeColor.Black
+            )
+            Text(
+                "Script-aware timestamps from device audio + screen/PDF",
+                color=ComposeColor.DarkGray
+            )
+            Button(
+                onClick={picker.launch(arrayOf("application/pdf"))},
+                modifier=Modifier.fillMaxWidth()
+            ){Text("UPLOAD PDF")}
+            Button(
+                onClick={::start},
+                modifier=Modifier.fillMaxWidth()
+            ){Text("START")}
+            Button(
+                onClick={
+                    val uri=store.lastPdf()
+                    if(uri==null){
+                        msg="No PDF recorded yet"
+                    }else{
+                        runCatching{
+                            startActivity(
+                                Intent(Intent.ACTION_VIEW,uri).addFlags(
+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                )
+                            )
+                        }.onFailure{
+                            msg="Cannot open the last PDF."
+                        }
+                    }
+                },
+                modifier=Modifier.fillMaxWidth()
+            ){Text("LAST PDF RECORDED")}
+            Button(
+                onClick={confirm=true},
+                modifier=Modifier.fillMaxWidth()
+            ){Text("NEW SESSION")}
+
+            if(script.isNotEmpty()){
+                Text(
+                    "Loaded script: "+script.size+" lines",
+                    style=MaterialTheme.typography.titleMedium,
+                    color=ComposeColor.Black
+                )
+                LazyColumn(Modifier.weight(1f)){
+                    items(script){Text(it,color=ComposeColor.Black)}
+                }
+            }else{
+                Spacer(Modifier.weight(1f))
+            }
+
             msg?.let{Text(it,color=ComposeColor.Black)}
         }
-        if(confirm)AlertDialog(onDismissRequest={confirm=false},confirmButton={TextButton({store.clearSession();script=emptyList();msg="New session created.";confirm=false}){Text("Continue")}},dismissButton={TextButton({confirm=false}){Text("Cancel")}},title={Text("Clear current session?")},text={Text("This clears current script, timestamps and PDF reference. Saved files in Downloads are not deleted.")}})
+
+        if(confirm){
+            AlertDialog(
+                onDismissRequest={confirm=false},
+                title={Text("Clear current session?")},
+                text={
+                    Text(
+                        "This clears current script, timestamps and PDF reference. "+
+                        "Saved files in Downloads are not deleted."
+                    )
+                },
+                confirmButton={
+                    TextButton(onClick={
+                        store.clearSession()
+                        script=emptyList()
+                        msg="New session created."
+                        confirm=false
+                    }){Text("Continue")}
+                },
+                dismissButton={
+                    TextButton(onClick={confirm=false}){Text("Cancel")}
+                }
+            )
+        }
     }
 }
