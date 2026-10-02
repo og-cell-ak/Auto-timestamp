@@ -292,7 +292,15 @@ object PdfScriptParser {
                         bmp.eraseColor(Color.WHITE);page.render(bmp,null,null,PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                         val ys=yellowBands(bmp); if(ys.isNotEmpty()){
                             val frame=o.read(bmp); val cuts=regions(ys,bmp.height)
-                            cuts.forEach{(top,bottom)->out+=frame.lines.filter{val y=(it.bounds.top+it.bounds.bottom)/2f;y in top..bottom}.joinToString(" "){it.text}.trim()}
+                            cuts.forEach{(top,bottom)->
+                                val segment=frame.lines
+                                    .filter{
+                                        val y=(it.bounds.top+it.bounds.bottom)/2f
+                                        y in top..bottom
+                                    }
+                                    .joinToString(" "){it.text}
+                                cleanSegment(segment).takeIf{it.isNotBlank()}?.let{out+=it}
+                            }
                         }
                         bmp.recycle()
                     } finally {page.close()}
@@ -302,6 +310,29 @@ object PdfScriptParser {
             } finally{o.close()}
         }}
     }
+    private fun cleanSegment(raw:String):String{
+        var s=raw
+            .replace(Regex("[\\u2500-\\u257F]+"), " ")
+            .replace(Regex("[-_=.]{4,}"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        // Remove list numbering only when it is at the beginning of a yellow-line segment.
+        s=s.replaceFirst(
+            Regex("^\\s*(?:[0-9]{1,4}|[IVXLCDM]{1,8})\\s*[.)\\-:、]\\s*"),
+            ""
+        )
+
+        // OCR sometimes reads a page number/footer after a separator as part of the segment.
+        // Remove it only when it is a standalone trailing number.
+        s=s.replace(
+            Regex("\\s+(?:page\\s*)?[0-9]{1,4}\\s*$", RegexOption.IGNORE_CASE),
+            ""
+        ).trim()
+
+        return s
+    }
+
     private fun yellowBands(b:Bitmap):List<Int>{
         val ys=mutableListOf<Int>();var on=false;var s=0;val step=max(1,b.width/250)
         for(y in 0 until b.height){var n=0;for(x in 0 until b.width step step){val c=b.getPixel(x,y);val rr=Color.red(c);val gg=Color.green(c);val bb=Color.blue(c);if(rr>180&&gg>140&&bb<130&&rr>bb*1.4f)n++};val yes=n>=8;if(yes&&!on){s=y;on=true};if(!yes&&on){if(y-s>=2)ys+=(s+y-1)/2;on=false}}
