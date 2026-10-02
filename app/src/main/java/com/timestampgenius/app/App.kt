@@ -339,6 +339,17 @@ class TimestampService:Service(){
     private var latestFrame:OcrFrame?=null
     private var screenMode=false
     private val speechBacklog=ArrayDeque<SpeechResult>()
+    private val scrollRunnable=object:Runnable{
+        override fun run(){
+            if(!recording.get()) return
+            val speed=guide?.m?.scrollSpeed ?: 0
+            if(speed>0) AccessibilityBridge.scrollForward()
+            if(recording.get() && speed>0){
+                val delay=(1500L-(speed*140L)).coerceAtLeast(100L)
+                main.postDelayed(this,delay)
+            }
+        }
+    }
     override fun onCreate(){super.onCreate();store=SessionStore(this);wm=getSystemService(WINDOW_SERVICE) as WindowManager;notificationChannel();lines=store.loadScript().mapIndexed{i,s->ScriptLine(i,s)}.toMutableList();showIcon()}
     override fun onStartCommand(i:Intent?,f:Int,id:Int):Int{when(i?.action){PREPARE->prepare(i);START->startRecording();STOP->stopRecording();SAVE->savePdf();SET->setLines()};return START_STICKY}
     override fun onBind(intent:Intent?):IBinder? = null
@@ -365,7 +376,7 @@ class TimestampService:Service(){
     private fun startRecording(){if(recording.get())return;if(Build.VERSION.SDK_INT<29){toast("Device audio capture needs Android 10 or newer.");return};val p=projection?:run{toast("Press START on the main screen first.");return};lines=store.loadScript().mapIndexed{i,s->ScriptLine(i,s)}.toMutableList()
         if(lines.isEmpty())lines=store.loadLines()
         screenMode=lines.isEmpty()
-        matcher=if(lines.isEmpty())null else FuzzyMatcher{lines.map{it.text}}startNs=System.nanoTime();recording.set(true);ensureRuntimeOverlays();val sr=16000;val minb=AudioRecord.getMinBufferSize(sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(8192);val cfg=AudioPlaybackCaptureConfiguration.Builder(p).addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME).addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build();audio=runCatching{AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()).setBufferSizeInBytes(minb*2).setAudioPlaybackCaptureConfig(cfg).build()}.getOrNull();if(audio==null){recording.set(false);toast("The source app blocked playback capture.");return};engineHi=VoskEngine(this,"vosk-hi").takeIf{it.start()};engineEn=VoskEngine(this,"vosk-en").takeIf{it.start()};if(engineHi==null&&engineEn==null){recording.set(false);toast("Offline speech model could not start.");return};audio!!.startRecording();audioThread=Thread{val buf=ByteArray(minb);while(recording.get()){val n=runCatching{audio!!.read(buf,0,buf.size)}.getOrDefault(0);if(n>0){val hy=buildList{engineHi?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)
+        matcher=if(lines.isEmpty())null else FuzzyMatcher{lines.map{it.text}}startNs=System.nanoTime();recording.set(true);ensureRuntimeOverlays();main.post(scrollRunnable);val sr=16000;val minb=AudioRecord.getMinBufferSize(sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(8192);val cfg=AudioPlaybackCaptureConfiguration.Builder(p).addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME).addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build();audio=runCatching{AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()).setBufferSizeInBytes(minb*2).setAudioPlaybackCaptureConfig(cfg).build()}.getOrNull();if(audio==null){recording.set(false);toast("The source app blocked playback capture.");return};engineHi=VoskEngine(this,"vosk-hi").takeIf{it.start()};engineEn=VoskEngine(this,"vosk-en").takeIf{it.start()};if(engineHi==null&&engineEn==null){recording.set(false);toast("Offline speech model could not start.");return};audio!!.startRecording();audioThread=Thread{val buf=ByteArray(minb);while(recording.get()){val n=runCatching{audio!!.read(buf,0,buf.size)}.getOrDefault(0);if(n>0){val hy=buildList{engineHi?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)
                                     engineEn?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)};val best=hy.maxByOrNull{score(lines.getOrNull(matcher?.current?:0)?.text.orEmpty(),it.text)}
                                 if(best!=null)handleSpeech(best)}}}.apply{start()} }
     private fun handleSpeech(s:SpeechResult){
@@ -387,6 +398,7 @@ class TimestampService:Service(){
             lines[idx].timestampMs=(System.nanoTime()-startNs)/1_000_000
             lines[idx].detected=true
             store.saveLines(lines)
+            if((guide?.m?.scrollSpeed ?: 0)>0) AccessibilityBridge.scrollForward()
         }
         main.post{
             updateHighlights()
@@ -490,7 +502,7 @@ class TimestampService:Service(){
         return hit.toFloat()/max(x.size,y.size).toFloat()
     }
     private fun imageBitmap(i:Image):Bitmap?{val pl=i.planes.firstOrNull()?:return null;val ps=pl.pixelStride;val row=pl.rowStride;val pad=row-ps*i.width;val tmp=Bitmap.createBitmap(i.width+pad/ps,i.height,Bitmap.Config.ARGB_8888);pl.buffer.rewind();tmp.copyPixelsFromBuffer(pl.buffer);return if(pad==0)tmp else Bitmap.createBitmap(tmp,0,0,i.width,i.height).also{tmp.recycle()}}
-    private fun stopRecording(){recording.set(false);runCatching{audio?.stop()};audio?.release();audio=null;engineHi?.close();engineHi=null;engineEn?.close();engineEn=null;store.saveLines(lines);toast("Stopped. Timestamps are retained.")}
+    private fun stopRecording(){recording.set(false);main.removeCallbacks(scrollRunnable);runCatching{audio?.stop()};audio?.release();audio=null;engineHi?.close();engineHi=null;engineEn?.close();engineEn=null;store.saveLines(lines);toast("Stopped. Timestamps are retained.")}
     private fun savePdf(){if(recording.get())stopRecording();val out=if(lines.isNotEmpty())lines else store.loadLines();if(out.isEmpty()){toast("No timestamps recorded yet.");return};val name="ScriptTimestamps_"+SimpleDateFormat("yyyy-MM-dd_HH-mm",Locale.US).format(Date())+".pdf";val v=ContentValues().apply{put(MediaStore.Downloads.DISPLAY_NAME,name);put(MediaStore.Downloads.MIME_TYPE,"application/pdf");put(MediaStore.Downloads.RELATIVE_PATH,"Download/ScriptTimestamper")};val uri=contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,v)?:run{toast("Could not create the PDF.");return};runCatching{contentResolver.openOutputStream(uri)!!.use{PdfWriter.write(out,it)};store.setLastPdf(uri);toast("Saved "+name+" in Downloads/ScriptTimestamper")}.onFailure{contentResolver.delete(uri,null,null);toast("PDF save failed: "+(it.message?: "unknown error"))}}
     private fun btn(l:LinearLayout,s:String,click:()->Unit){l.addView(Button(this).apply{text=s;setTextColor(Color.BLACK);setBackgroundColor(Color.WHITE);setOnClickListener{click()}})}
     private fun remove(v:View?){if(v!=null&&v.parent!=null)runCatching{wm.removeView(v)}}
@@ -498,7 +510,7 @@ class TimestampService:Service(){
     private fun notificationChannel(){if(Build.VERSION.SDK_INT>=26)getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("tg","Timestamp Genius",NotificationManager.IMPORTANCE_LOW))}
     private fun notification(s:String)=androidx.core.app.NotificationCompat.Builder(this,"tg").setSmallIcon(android.R.drawable.ic_menu_recent_history).setContentTitle("Timestamp Genius").setContentText(s).setOngoing(true).build()
     private inner class DragTouch:View.OnTouchListener{var x=0f;var y=0f;var moved=false;override fun onTouch(v:View,e:MotionEvent):Boolean{val p=iconP?:return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{x=e.rawX;y=e.rawY;moved=false;return false};MotionEvent.ACTION_MOVE->{val dx=e.rawX-x;val dy=e.rawY-y;if(abs(dx)>4||abs(dy)>4)moved=true;p.x+=dx.toInt();p.y=max(0,p.y+dy.toInt());runCatching{wm.updateViewLayout(icon,p)};x=e.rawX;y=e.rawY;return true};MotionEvent.ACTION_UP->return moved};return false}}
-    override fun onDestroy(){recording.set(false);speechBacklog.clear();runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.stop()};remove(icon);remove(menu);remove(guide);remove(hi);main.removeCallbacksAndMessages(null);super.onDestroy()}
+    override fun onDestroy(){recording.set(false);main.removeCallbacks(scrollRunnable);speechBacklog.clear();runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.stop()};remove(icon);remove(menu);remove(guide);remove(hi);main.removeCallbacksAndMessages(null);super.onDestroy()}
 }
 
 object PdfWriter {
