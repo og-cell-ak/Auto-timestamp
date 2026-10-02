@@ -55,6 +55,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 data class ScriptLine(val index: Int, val text: String, var timestampMs: Long? = null, var detected: Boolean = false)
 data class WordBox(val text: String, val bounds: RectF)
 data class OcrFrame(val text: String, val words: List<WordBox>, val lines: List<WordBox>)
+data class SpeechResult(val text: String, val isFinal: Boolean)
+data class MatchEvent(val completedIndex: Int = -1, val skippedIndices: List<Int> = emptyList(), val progress: Int = 0)
 data class LineLayout(var heightFraction: Float = .2f, var widthFraction: Float = 1f, var cornerRadius: Float = 10f, var unlocked: Boolean = false)
 data class OverlayLayout(
     var x: Int = 24, var y: Int = 170, var width: Int = 720, var height: Int = 640,
@@ -104,27 +106,107 @@ class SessionStore(private val context: Context) {
     }
 }
 
-class FuzzyMatcher(private val lines: MutableList<String>) {
-    var current = 0; private var observed = mutableListOf<String>(); var progress = 0
-    fun feed(s: String): Boolean {
-        if (current >= lines.size) return false
-        val expected=TextNorm.tokens(lines[current]); if(expected.isEmpty()){current++;return true}
-        observed += TextNorm.tokens(s); if(observed.size>expected.size*4+20) observed=observed.takeLast(expected.size*4+20).toMutableList()
-        var p=0
-        for (o in observed) if(p<expected.size && similar(expected[p],o)) p++
-        val finished=p>=expected.size; progress=p
-        if(finished){current++;observed.clear();progress=0}
-        return finished
+class FuzzyMatcher(private val source:()->List<String>) {
+    var current=0
+    var progress=0
+    private val committed=mutableListOf<String>()
+    private var partial=emptyList<String>()
+
+    fun feed(result:SpeechResult):MatchEvent{
+        val all=source()
+        if(current>=all.size)return MatchEvent(progress=progress)
+        val tokens=TextNorm.tokens(result.text)
+        if(tokens.isEmpty())return MatchEvent(progress=progress)
+
+        if(result.isFinal){
+            committed+=tokens
+            partial=emptyList()
+        }else{
+            partial=tokens
+        }
+
+        var event=evaluate(all,committed+partial)
+
+        if(event.completedIndex<0 && result.isFinal && current+1<all.size){
+            val best=bestUpcoming(tokens,all)
+            if(best>current){
+                val skipped=(current until best).toList()
+                current=best
+                progress=0
+                committed.clear()
+                partial=tokens
+                val next=evaluate(all,committed+partial)
+                event=next.copy(skippedIndices=skipped+next.skippedIndices)
+            }
+        }
+        return event
     }
-    private fun similar(a:String,b:String):Boolean {
+
+    private fun evaluate(all:List<String>,candidate:List<String>):MatchEvent{
+        val expected=TextNorm.tokens(all.getOrNull(current).orEmpty())
+        if(expected.isEmpty()){
+            val idx=current
+            current++
+            committed.clear()
+            partial=emptyList()
+            progress=0
+            return MatchEvent(completedIndex=idx,progress=0)
+        }
+        progress=orderedProgress(expected,candidate)
+        if(progress>=expected.size){
+            val idx=current
+            current++
+            committed.clear()
+            partial=emptyList()
+            progress=0
+            return MatchEvent(completedIndex=idx,progress=expected.size)
+        }
+        return MatchEvent(progress=progress)
+    }
+
+    private fun bestUpcoming(tokens:List<String>,all:List<String>):Int{
+        var best=current
+        var bestScore=0f
+        val end=minOf(all.lastIndex,current+6)
+        for(i in current+1..end){
+            val e=TextNorm.tokens(all[i])
+            if(e.size<2)continue
+            val matched=tokens.count{t->e.any{similar(it,t)}}
+            val score=matched.toFloat()/e.size.toFloat()
+            if(matched>=2 && score>=0.62f && score>bestScore){
+                best=i
+                bestScore=score
+            }
+        }
+        return best
+    }
+
+    private fun orderedProgress(expected:List<String>,candidate:List<String>):Int{
+        var p=0
+        for(token in candidate){
+            if(p<expected.size && similar(expected[p],token))p++
+        }
+        return p
+    }
+
+    private fun similar(a:String,b:String):Boolean{
         if(a==b)return true
         if(a.length<3||b.length<3)return a.firstOrNull()==b.firstOrNull()
         if(a.first()!=b.first())return false
         return abs(a.length-b.length)<=2 || distance(a,b)<=max(1,minOf(a.length,b.length)/3)
     }
-    private fun distance(a:String,b:String):Int {
+
+    private fun distance(a:String,b:String):Int{
         val d=IntArray(b.length+1){it}
-        for(i in 1..a.length){var prev=d[0];d[0]=i;for(j in 1..b.length){val t=d[j];d[j]=minOf(d[j]+1,d[j-1]+1,prev+if(a[i-1]==b[j-1])0 else 1);prev=t}}
+        for(i in 1..a.length){
+            var prev=d[0]
+            d[0]=i
+            for(j in 1..b.length){
+                val old=d[j]
+                d[j]=minOf(d[j]+1,d[j-1]+1,prev+if(a[i-1]==b[j-1])0 else 1)
+                prev=old
+            }
+        }
         return d[b.length]
     }
 }
@@ -136,7 +218,14 @@ class VoskEngine(private val context: Context, private val assetName: String):Au
         if(!File(dir,".ready").exists()){ if(dir.exists())dir.deleteRecursively();dir.mkdirs();copyAssets(context,assetName,dir);File(dir,".ready").writeText("ok") }
         model=Model(dir.absolutePath);r=Recognizer(model,16000f);true
     }.getOrDefault(false)
-    fun accept(data:ByteArray,n:Int):String?=runCatching { val rr=r?:return null; if(rr.acceptWaveForm(data,n))JSONObject(rr.result).optString("text") else JSONObject(rr.partialResult).optString("partial") }.getOrNull()
+    fun accept(data:ByteArray,n:Int):SpeechResult?=runCatching {
+        val rr=r?:return null
+        if(rr.acceptWaveForm(data,n)){
+            SpeechResult(JSONObject(rr.result).optString("text"),true)
+        }else{
+            SpeechResult(JSONObject(rr.partialResult).optString("partial"),false)
+        }
+    }.getOrNull()
     override fun close(){runCatching{r?.close()};runCatching{model?.close()};r=null;model=null}
     private fun copyAssets(c:Context,path:String,to:File){
         val list=c.assets.list(path) ?: emptyArray()
@@ -205,6 +294,18 @@ class GuideView(c:Context):View(c){
     private val fill=Paint(3).apply{style=Paint.Style.FILL;color=0x18FFFF00}
     private val handle=Paint(3).apply{style=Paint.Style.FILL;color=Color.YELLOW}
     private var mode=0;private var lx=0f;private var ly=0f
+    fun lineRects():List<RectF>{
+        val x=m.x.toFloat();val y=m.y.toFloat();val w=m.width.toFloat();val h=m.height.toFloat()
+        val total=m.lines.sumOf{it.heightFraction.coerceAtLeast(.04f).toDouble()}.toFloat()
+        var cy=y
+        return m.lines.map{q->
+            val hh=h*(q.heightFraction.coerceAtLeast(.04f)/total)
+            val rect=RectF(x,cy,x+w*q.widthFraction.coerceIn(.35f,1f),cy+hh)
+            cy+=hh
+            rect
+        }
+    }
+
     override fun onDraw(c:Canvas){val x=m.x.toFloat();val y=m.y.toFloat();val w=m.width.toFloat();val h=m.height.toFloat();c.drawRoundRect(x,y,x+w,y+h,12f,12f,fill);c.drawRoundRect(x,y,x+w,y+h,12f,12f,border);var cy=y;val total=m.lines.sumOf{it.heightFraction.coerceAtLeast(.04f).toDouble()}.toFloat();m.lines.forEachIndexed{i,q->val hh=h*(q.heightFraction.coerceAtLeast(.04f)/total);val rect=RectF(x,cy,x+w*q.widthFraction.coerceIn(.35f,1f),cy+hh);c.drawRoundRect(rect,q.cornerRadius,q.cornerRadius,line);if(edit&&i==selected)c.drawCircle(rect.right,rect.bottom,12f,handle);cy+=hh}}
     override fun onTouchEvent(e:MotionEvent):Boolean{if(!edit)return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{lx=e.rawX;ly=e.rawY;mode=hit(e.rawX,e.rawY);return true};MotionEvent.ACTION_MOVE->{val dx=e.rawX-lx;val dy=e.rawY-ly;lx=e.rawX;ly=e.rawY;when(mode){1->{m.x+=dx.toInt();m.y+=dy.toInt()};2->{m.width=max(280,m.width+dx.toInt())};3->{m.height=max(180,m.height+dy.toInt())};4->{val q=m.lines[selected];q.heightFraction=(q.heightFraction+dy/1200f).coerceIn(.04f,.8f);q.widthFraction=(q.widthFraction+dx/1600f).coerceIn(.35f,1f)}};invalidate();return true}};return true}
     private fun hit(px:Float,py:Float):Int{
@@ -231,7 +332,13 @@ class TimestampService:Service(){
     private var projection:MediaProjection?=null;private var reader:ImageReader?=null;private var display:VirtualDisplay?=null
     private var audio:AudioRecord?=null;private var audioThread:Thread?=null;private var ocr:OcrEngine?=null
     private var engineHi:VoskEngine?=null;private var engineEn:VoskEngine?=null;private var matcher:FuzzyMatcher?=null
-    private var lines=mutableListOf<ScriptLine>();private val recording=AtomicBoolean(false);private var startNs=0L;private var visibleWords=emptyList<WordBox>()
+    private var lines=mutableListOf<ScriptLine>()
+    private val recording=AtomicBoolean(false)
+    private var startNs=0L
+    private var visibleWords=emptyList<WordBox>()
+    private var latestFrame:OcrFrame?=null
+    private var screenMode=false
+    private val speechBacklog=ArrayDeque<SpeechResult>()
     override fun onCreate(){super.onCreate();store=SessionStore(this);wm=getSystemService(WINDOW_SERVICE) as WindowManager;notificationChannel();lines=store.loadScript().mapIndexed{i,s->ScriptLine(i,s)}.toMutableList();showIcon()}
     override fun onStartCommand(i:Intent?,f:Int,id:Int):Int{when(i?.action){PREPARE->prepare(i);START->startRecording();STOP->stopRecording();SAVE->savePdf();SET->setLines()};return START_STICKY}
     override fun onBind(intent:Intent?):IBinder? = null
@@ -255,11 +362,133 @@ class TimestampService:Service(){
     private fun setLines(){val gv=GuideView(this).apply{m=store.layout();edit=true};guide=gv;val gp=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START};runCatching{wm.addView(gv,gp)};val p=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL;setPadding(8,8,8,8);setBackgroundColor(Color.WHITE)};btn(p,"−"){adjust(gv,-1)};btn(p,"+"){adjust(gv,1)};btn(p,"LOCK"){toggleLock(gv)};btn(p,"CORNER +"){val q=gv.m.lines[gv.selected];q.cornerRadius=(q.cornerRadius+4).coerceAtMost(40f);gv.invalidate()};btn(p,"SCROLL "+gv.m.scrollSpeed){gv.m.scrollSpeed=(gv.m.scrollSpeed+1)%10;(p.getChildAt(4)as Button).text="SCROLL "+gv.m.scrollSpeed};btn(p,"SAVE LAYOUT"){store.saveLayout(gv.m);remove(gv);remove(p)};btn(p,"CLOSE"){remove(gv);remove(p)};val pp=WindowManager.LayoutParams(-2,-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.CENTER_HORIZONTAL;y=10};runCatching{wm.addView(p,pp)}}
     private fun adjust(g:GuideView,d:Int){val n=(g.m.lineCount+d).coerceIn(1,20);g.m.lineCount=n;while(g.m.lines.size<n)g.m.lines.add(LineLayout());while(g.m.lines.size>n)g.m.lines.removeAt(g.m.lines.lastIndex);val q=1f/n;g.m.lines.forEach{if(!it.unlocked)it.heightFraction=q};g.invalidate()}
     private fun toggleLock(g:GuideView){val i=g.selected;g.m.lines[i].unlocked=!g.m.lines[i].unlocked;g.invalidate()}
-    private fun startRecording(){if(recording.get())return;if(Build.VERSION.SDK_INT<29){toast("Device audio capture needs Android 10 or newer.");return};val p=projection?:run{toast("Press START on the main screen first.");return};lines=store.loadScript().mapIndexed{i,s->ScriptLine(i,s)}.toMutableList();if(lines.isEmpty())lines=store.loadLines();matcher=FuzzyMatcher(lines.map{it.text}.toMutableList());startNs=System.nanoTime();recording.set(true);ensureRuntimeOverlays();val sr=16000;val minb=AudioRecord.getMinBufferSize(sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(8192);val cfg=AudioPlaybackCaptureConfiguration.Builder(p).addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME).addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build();audio=runCatching{AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()).setBufferSizeInBytes(minb*2).setAudioPlaybackCaptureConfig(cfg).build()}.getOrNull();if(audio==null){recording.set(false);toast("The source app blocked playback capture.");return};engineHi=VoskEngine(this,"vosk-hi").takeIf{it.start()};engineEn=VoskEngine(this,"vosk-en").takeIf{it.start()};if(engineHi==null&&engineEn==null){recording.set(false);toast("Offline speech model could not start.");return};audio!!.startRecording();audioThread=Thread{val buf=ByteArray(minb);while(recording.get()){val n=runCatching{audio!!.read(buf,0,buf.size)}.getOrDefault(0);if(n>0){val hy=buildList{engineHi?.accept(buf,n)?.takeIf{it.isNotBlank()}?.let(::add);engineEn?.accept(buf,n)?.takeIf{it.isNotBlank()}?.let(::add)};val best=hy.maxByOrNull{score(lines.getOrNull(matcher?.current?:0)?.text.orEmpty(),it)};if(best!=null)handleSpeech(best)}}}.apply{start()} }
-    private fun handleSpeech(s:String){val m=matcher?:return;val before=m.current;val finished=m.feed(s);val idx=before;if(finished&&idx in lines.indices){lines[idx].timestampMs=(System.nanoTime()-startNs)/1_000_000;lines[idx].detected=true;store.saveLines(lines);hi?.rects=emptyList()};val n=m.progress;main.post{hi?.rects=visibleWords.take(n).map{it.bounds};hi?.invalidate()};if(m.current>=lines.size)main.post{stopRecording()}}
-    private fun score(expected:String,observed:String):Int{val e=TextNorm.tokens(expected);val o=TextNorm.tokens(observed);return o.count{ot->e.any{et->ot==et||(ot.length>2&&et.length>2&&ot.first()==et.first())}}}
+    private fun startRecording(){if(recording.get())return;if(Build.VERSION.SDK_INT<29){toast("Device audio capture needs Android 10 or newer.");return};val p=projection?:run{toast("Press START on the main screen first.");return};lines=store.loadScript().mapIndexed{i,s->ScriptLine(i,s)}.toMutableList()
+        if(lines.isEmpty())lines=store.loadLines()
+        screenMode=lines.isEmpty()
+        matcher=if(lines.isEmpty())null else FuzzyMatcher{lines.map{it.text}}startNs=System.nanoTime();recording.set(true);ensureRuntimeOverlays();val sr=16000;val minb=AudioRecord.getMinBufferSize(sr,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(8192);val cfg=AudioPlaybackCaptureConfiguration.Builder(p).addMatchingUsage(AudioAttributes.USAGE_MEDIA).addMatchingUsage(AudioAttributes.USAGE_GAME).addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build();audio=runCatching{AudioRecord.Builder().setAudioFormat(AudioFormat.Builder().setSampleRate(sr).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()).setBufferSizeInBytes(minb*2).setAudioPlaybackCaptureConfig(cfg).build()}.getOrNull();if(audio==null){recording.set(false);toast("The source app blocked playback capture.");return};engineHi=VoskEngine(this,"vosk-hi").takeIf{it.start()};engineEn=VoskEngine(this,"vosk-en").takeIf{it.start()};if(engineHi==null&&engineEn==null){recording.set(false);toast("Offline speech model could not start.");return};audio!!.startRecording();audioThread=Thread{val buf=ByteArray(minb);while(recording.get()){val n=runCatching{audio!!.read(buf,0,buf.size)}.getOrDefault(0);if(n>0){val hy=buildList{engineHi?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)
+                                    engineEn?.accept(buf,n)?.takeIf{!it.text.isBlank()}?.let(::add)};val best=hy.maxByOrNull{score(lines.getOrNull(matcher?.current?:0)?.text.orEmpty(),it.text)}
+                                if(best!=null)handleSpeech(best)}}}.apply{start()} }
+    private fun handleSpeech(s:SpeechResult){
+        val m=matcher
+        if(m==null){
+            synchronized(speechBacklog){
+                if(speechBacklog.size>=24)speechBacklog.removeFirst()
+                speechBacklog.addLast(s)
+            }
+            return
+        }
+        val before=m.current
+        val event=m.feed(s)
+        val idx=event.completedIndex
+        if(event.skippedIndices.isNotEmpty()){
+            event.skippedIndices.forEach{if(it in lines.indices){lines[it].timestampMs=null;lines[it].detected=false}}
+        }
+        if(idx in lines.indices){
+            lines[idx].timestampMs=(System.nanoTime()-startNs)/1_000_000
+            lines[idx].detected=true
+            store.saveLines(lines)
+        }
+        main.post{
+            updateHighlights()
+            hi?.invalidate()
+        }
+        if(m.current>=lines.size && lines.isNotEmpty()){
+            main.post{stopRecording()}
+        }
+    }
+
+    private fun updateHighlights(){
+        val frame=latestFrame ?: return
+        val m=matcher ?: return
+        val expected=lines.getOrNull(m.current)?.text.orEmpty()
+        if(expected.isBlank()){
+            hi?.rects=emptyList()
+            return
+        }
+        val line=frame.lines.maxByOrNull{lineScore(expected,it.text)}
+        if(line==null){
+            hi?.rects=emptyList()
+            return
+        }
+        val words=frame.words.filter{
+            val cy=(it.bounds.top+it.bounds.bottom)/2f
+            cy>=line.bounds.top && cy<=line.bounds.bottom
+        }.sortedBy{it.bounds.left}
+        hi?.rects=words.take(m.progress).map{it.bounds}
+    }
+
+    private fun lineScore(expected:String,observed:String):Int{
+        val e=TextNorm.tokens(expected)
+        val o=TextNorm.tokens(observed)
+        if(e.isEmpty()||o.isEmpty())return 0
+        return o.count{ot->e.any{et->ot==et || (ot.length>2&&et.length>2&&ot.first()==et.first())}}
+    }
+    private fun score(expected:String,observed:String):Int{
+        val e=TextNorm.tokens(expected)
+        val o=TextNorm.tokens(observed)
+        return o.count{ot->e.any{et->ot==et||(ot.length>2&&et.length>2&&ot.first()==et.first())}}
+    }
     private fun ensureRuntimeOverlays(){if(guide?.parent==null){val g=GuideView(this).apply{m=store.layout();edit=false};guide=g;val p=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START};runCatching{wm.addView(g,p)}};if(hi?.parent==null){val h=HighlightView(this);hi=h;val p=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START};runCatching{wm.addView(h,p)}}}
-    private fun capture(r:ImageReader){val img=r.acquireLatestImage()?:return;try{val b=imageBitmap(img)?:return;CoroutineScope(Dispatchers.Default).launch{val frame=runCatching{ocr?.read(b)}.getOrNull();if(frame!=null)main.post{visibleWords=frame.words};b.recycle()}}finally{img.close()}}
+    private fun capture(r:ImageReader){
+        val img=r.acquireLatestImage() ?: return
+        try{
+            val b=imageBitmap(img) ?: return
+            CoroutineScope(Dispatchers.Default).launch{
+                val frame=runCatching{ocr?.read(b)}.getOrNull()
+                if(frame!=null){
+                    main.post{
+                        latestFrame=frame
+                        visibleWords=frame.words
+                        if(screenMode) updateScreenScript(frame)
+                        updateHighlights()
+                        hi?.invalidate()
+                    }
+                }
+                b.recycle()
+            }
+        }finally{img.close()}
+    }
+
+    private fun updateScreenScript(frame:OcrFrame){
+        if(!screenMode)return
+        val gv=guide ?: return
+        val rects=gv.lineRects()
+        val candidates=mutableListOf<String>()
+        rects.forEach{rect->
+            val text=frame.lines
+                .filter{
+                    val cy=(it.bounds.top+it.bounds.bottom)/2f
+                    cy>=rect.top && cy<=rect.bottom
+                }
+                .sortedBy{it.bounds.top}
+                .joinToString(" "){it.text}
+                .trim()
+            if(text.isNotBlank())candidates+=text
+        }
+        if(candidates.isEmpty())return
+        val recent=lines.takeLast(10).map{TextNorm.tokens(it.text).joinToString(" ")}
+        for(candidate in candidates){
+            val n=TextNorm.tokens(candidate).joinToString(" ")
+            if(n.length<3)continue
+            val duplicate=recent.any{r->r==n || (r.isNotBlank() && n.length>8 && r.length>8 && similarityText(r,n)>0.82f)}
+            if(!duplicate){
+                lines+=ScriptLine(lines.size,candidate)
+            }
+        }
+        if(matcher==null && lines.isNotEmpty()){
+            matcher=FuzzyMatcher{lines.map{it.text}}
+            val pending=synchronized(speechBacklog){val x=speechBacklog.toList();speechBacklog.clear();x}
+            pending.forEach{handleSpeech(it)}
+        }
+        if(lines.isNotEmpty())store.saveLines(lines)
+    }
+
+    private fun similarityText(a:String,b:String):Float{
+        val x=TextNorm.tokens(a);val y=TextNorm.tokens(b)
+        if(x.isEmpty()||y.isEmpty())return 0f
+        val hit=x.count{it in y}
+        return hit.toFloat()/max(x.size,y.size).toFloat()
+    }
     private fun imageBitmap(i:Image):Bitmap?{val pl=i.planes.firstOrNull()?:return null;val ps=pl.pixelStride;val row=pl.rowStride;val pad=row-ps*i.width;val tmp=Bitmap.createBitmap(i.width+pad/ps,i.height,Bitmap.Config.ARGB_8888);pl.buffer.rewind();tmp.copyPixelsFromBuffer(pl.buffer);return if(pad==0)tmp else Bitmap.createBitmap(tmp,0,0,i.width,i.height).also{tmp.recycle()}}
     private fun stopRecording(){recording.set(false);runCatching{audio?.stop()};audio?.release();audio=null;engineHi?.close();engineHi=null;engineEn?.close();engineEn=null;store.saveLines(lines);toast("Stopped. Timestamps are retained.")}
     private fun savePdf(){if(recording.get())stopRecording();val out=if(lines.isNotEmpty())lines else store.loadLines();if(out.isEmpty()){toast("No timestamps recorded yet.");return};val name="ScriptTimestamps_"+SimpleDateFormat("yyyy-MM-dd_HH-mm",Locale.US).format(Date())+".pdf";val v=ContentValues().apply{put(MediaStore.Downloads.DISPLAY_NAME,name);put(MediaStore.Downloads.MIME_TYPE,"application/pdf");put(MediaStore.Downloads.RELATIVE_PATH,"Download/ScriptTimestamper")};val uri=contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,v)?:run{toast("Could not create the PDF.");return};runCatching{contentResolver.openOutputStream(uri)!!.use{PdfWriter.write(out,it)};store.setLastPdf(uri);toast("Saved "+name+" in Downloads/ScriptTimestamper")}.onFailure{contentResolver.delete(uri,null,null);toast("PDF save failed: "+(it.message?: "unknown error"))}}
@@ -269,7 +498,7 @@ class TimestampService:Service(){
     private fun notificationChannel(){if(Build.VERSION.SDK_INT>=26)getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("tg","Timestamp Genius",NotificationManager.IMPORTANCE_LOW))}
     private fun notification(s:String)=androidx.core.app.NotificationCompat.Builder(this,"tg").setSmallIcon(android.R.drawable.ic_menu_recent_history).setContentTitle("Timestamp Genius").setContentText(s).setOngoing(true).build()
     private inner class DragTouch:View.OnTouchListener{var x=0f;var y=0f;var moved=false;override fun onTouch(v:View,e:MotionEvent):Boolean{val p=iconP?:return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{x=e.rawX;y=e.rawY;moved=false;return false};MotionEvent.ACTION_MOVE->{val dx=e.rawX-x;val dy=e.rawY-y;if(abs(dx)>4||abs(dy)>4)moved=true;p.x+=dx.toInt();p.y=max(0,p.y+dy.toInt());runCatching{wm.updateViewLayout(icon,p)};x=e.rawX;y=e.rawY;return true};MotionEvent.ACTION_UP->return moved};return false}}
-    override fun onDestroy(){recording.set(false);runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.stop()};remove(icon);remove(menu);remove(guide);remove(hi);main.removeCallbacksAndMessages(null);super.onDestroy()}
+    override fun onDestroy(){recording.set(false);speechBacklog.clear();runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.stop()};remove(icon);remove(menu);remove(guide);remove(hi);main.removeCallbacksAndMessages(null);super.onDestroy()}
 }
 
 object PdfWriter {
