@@ -774,7 +774,7 @@ class MainActivity:ComponentActivity(){
                     }){Text("Continue")}
                 },
                 dismissButton={
-                    TextButton(onClick={openAccessibilitySettings}){Text("Accessibility")}
+                    TextButton(onClick={openAccessibilitySettings()}){Text("Accessibility")}
                 }
             )
         }
