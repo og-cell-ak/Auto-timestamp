@@ -1,1 +1,4 @@
-<resources><string name="app_name">Timestamp Genius</string></resources>
+<resources>
+    <string name="app_name">Timestamp Genius</string>
+    <string name="accessibility_description">Timestamp Genius uses screen accessibility only to read visible script content when available and to scroll the current script during an active timestamp session.</string>
+</resources>
