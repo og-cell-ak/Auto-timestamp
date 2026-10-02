@@ -356,6 +356,9 @@ class TimestampService:Service(){
     private var latestFrame:OcrFrame?=null
     private var screenMode=false
     private val speechBacklog=ArrayDeque<SpeechResult>()
+    private var lastOcrNs=0L
+    private var ocrJob:Job?=null
+    private val serviceScope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
     private val scrollRunnable=object:Runnable{
         override fun run(){
             if(!recording.get()) return
@@ -385,7 +388,31 @@ class TimestampService:Service(){
         startForeground(NOTIF,notification("Ready"),ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         setupCapture()
     }
-    private fun setupCapture(){val p=projection?:return;val dm=resources.displayMetrics;reader=ImageReader.newInstance(dm.widthPixels,dm.heightPixels,PixelFormat.RGBA_8888,2);reader!!.setOnImageAvailableListener({capture(it) },main);display=p.createVirtualDisplay("TimestampGenius",dm.widthPixels,dm.heightPixels,dm.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,reader!!.surface,null,main);ocr=OcrEngine()}
+    private fun setupCapture(){
+        val p=projection ?: return
+        runCatching{display?.release()}
+        runCatching{reader?.close()}
+        runCatching{ocr?.close()}
+        val dm=resources.displayMetrics
+        reader=ImageReader.newInstance(dm.widthPixels,dm.heightPixels,PixelFormat.RGBA_8888,2)
+        reader!!.setOnImageAvailableListener({capture(it)},main)
+        display=p.createVirtualDisplay(
+            "TimestampGenius",
+            dm.widthPixels,
+            dm.heightPixels,
+            dm.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            reader!!.surface,
+            null,
+            main
+        )
+        ocr=OcrEngine()
+    }
+
+    override fun onConfigurationChanged(newConfig:android.content.res.Configuration){
+        super.onConfigurationChanged(newConfig)
+        if(projection!=null)main.post{setupCapture()}
+    }
     private fun showIcon(){if(icon?.parent!=null)return;val v=TextView(this).apply{text="TG";textSize=13f;gravity=Gravity.CENTER;setTextColor(Color.BLACK);setBackgroundColor(Color.YELLOW);setOnTouchListener(DragTouch());setOnClickListener{toggleMenu()}};icon=v;val p=WindowManager.LayoutParams(64,64,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START
             x=store.iconPosition().first
             y=store.iconPosition().second
@@ -474,10 +501,17 @@ class TimestampService:Service(){
     }
     private fun ensureRuntimeOverlays(){if(guide?.parent==null){val g=GuideView(this).apply{m=store.layout();edit=false};guide=g;val p=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START};runCatching{wm.addView(g,p)}};if(hi?.parent==null){val h=HighlightView(this);hi=h;val p=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START};runCatching{wm.addView(h,p)}}}
     private fun capture(r:ImageReader){
+        val now=System.nanoTime()
+        if(now-lastOcrNs<250_000_000L){
+            r.acquireLatestImage()?.close()
+            return
+        }
+        lastOcrNs=now
         val img=r.acquireLatestImage() ?: return
         try{
             val b=imageBitmap(img) ?: return
-            CoroutineScope(Dispatchers.Default).launch{
+            ocrJob?.cancel()
+            ocrJob=serviceScope.launch{
                 val frame=runCatching{ocr?.read(b)}.getOrNull()
                 if(frame!=null){
                     main.post{
@@ -510,13 +544,14 @@ class TimestampService:Service(){
             if(text.isNotBlank())candidates+=text
         }
         if(candidates.isEmpty())return
-        val recent=lines.takeLast(10).map{TextNorm.tokens(it.text).joinToString(" ")}
+        val recent=lines.takeLast(10).map{TextNorm.tokens(it.text).joinToString(" ")}.toMutableSet()
         for(candidate in candidates){
             val n=TextNorm.tokens(candidate).joinToString(" ")
             if(n.length<3)continue
             val duplicate=recent.any{r->r==n || (r.isNotBlank() && n.length>8 && r.length>8 && similarityText(r,n)>0.82f)}
             if(!duplicate){
                 lines+=ScriptLine(lines.size,candidate)
+                recent+=n
             }
         }
         if(matcher==null && lines.isNotEmpty()){
@@ -554,8 +589,8 @@ class TimestampService:Service(){
     private fun toast(s:String){main.post{Toast.makeText(this,s,Toast.LENGTH_LONG).show()}}
     private fun notificationChannel(){if(Build.VERSION.SDK_INT>=26)getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("tg","Timestamp Genius",NotificationManager.IMPORTANCE_LOW))}
     private fun notification(s:String)=androidx.core.app.NotificationCompat.Builder(this,"tg").setSmallIcon(android.R.drawable.ic_menu_recent_history).setContentTitle("Timestamp Genius").setContentText(s).setOngoing(true).build()
-    private inner class DragTouch:View.OnTouchListener{var x=0f;var y=0f;var moved=false;override fun onTouch(v:View,e:MotionEvent):Boolean{val p=iconP?:return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{x=e.rawX;y=e.rawY;moved=false;return false};MotionEvent.ACTION_MOVE->{val dx=e.rawX-x;val dy=e.rawY-y;if(abs(dx)>4||abs(dy)>4)moved=true;p.x+=dx.toInt();p.y=max(0,p.y+dy.toInt());runCatching{wm.updateViewLayout(icon,p)};x=e.rawX;y=e.rawY;return true};MotionEvent.ACTION_UP->{if(moved)store.saveIconPosition(p.x,p.y);return moved}};return false}}
-    override fun onDestroy(){recording.set(false);main.removeCallbacks(scrollRunnable);speechBacklog.clear();runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.unregisterCallback(projectionCallback)}
+    private inner class DragTouch:View.OnTouchListener{var x=0f;var y=0f;var moved=false;override fun onTouch(v:View,e:MotionEvent):Boolean{val p=iconP?:return false;when(e.actionMasked){MotionEvent.ACTION_DOWN->{x=e.rawX;y=e.rawY;moved=false;return false};MotionEvent.ACTION_MOVE->{val dx=e.rawX-x;val dy=e.rawY-y;if(abs(dx)>4||abs(dy)>4)moved=true;p.x=(p.x+dx.toInt()).coerceAtLeast(0);p.y=max(0,p.y+dy.toInt());runCatching{wm.updateViewLayout(icon,p)};x=e.rawX;y=e.rawY;return true};MotionEvent.ACTION_UP->{if(moved)store.saveIconPosition(p.x,p.y);return moved}};return false}}
+    override fun onDestroy(){recording.set(false);main.removeCallbacks(scrollRunnable);speechBacklog.clear();runCatching{audio?.release()};runCatching{engineHi?.close()};runCatching{engineEn?.close()};ocrJob?.cancel();serviceScope.cancel();runCatching{display?.release()};runCatching{reader?.close()};runCatching{projection?.unregisterCallback(projectionCallback)}
         runCatching{projection?.stop()};remove(icon);remove(menu);remove(guide);remove(hi);main.removeCallbacksAndMessages(null);super.onDestroy()}
 }
 
@@ -617,6 +652,9 @@ class MainActivity:ComponentActivity(){
         ){
             notifyLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }else{
+            if(!accessibilityEnabled()){
+                onMessage("For automatic scrolling, enable Timestamp Genius in Accessibility settings.")
+            }
             launchProjection()
         }
     }
