@@ -606,12 +606,42 @@ class MainActivity:ComponentActivity(){
         projectionLauncher.launch(manager.createScreenCaptureIntent())
     }
 
+    private fun beginPermissionFlow(onMessage:(String)->Unit={}){
+        if(Build.VERSION.SDK_INT>=23 && !Settings.canDrawOverlays(this)){
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:"+packageName)))
+            onMessage("Allow Display over other apps, then press START again.")
+            return
+        }
+        if(Build.VERSION.SDK_INT>=33 &&
+            ContextCompat.checkSelfPermission(this,Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED
+        ){
+            notifyLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }else{
+            launchProjection()
+        }
+    }
+
+    private fun accessibilityEnabled():Boolean{
+        val enabled=Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ).orEmpty()
+        return enabled.split(':').any{
+            ComponentName.unflattenFromString(it)?.packageName==packageName
+        }
+    }
+
+    private fun openAccessibilitySettings(){
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+
     @Composable
     private fun AppUi(){
         val scope=rememberCoroutineScope()
         var script by remember{mutableStateOf(store.loadScript())}
         var msg by remember{mutableStateOf<String?>(null)}
         var confirm by remember{mutableStateOf(false)}
+        var permissionInfo by remember{mutableStateOf(false)}
 
         val picker=rememberLauncherForActivityResult(
             ActivityResultContracts.OpenDocument()
@@ -723,6 +753,30 @@ class MainActivity:ComponentActivity(){
             }
 
             msg?.let{Text(it,color=ComposeColor.Black)}
+        }
+
+        if(permissionInfo){
+            AlertDialog(
+                onDismissRequest={permissionInfo=false},
+                title={Text("Permissions needed")},
+                text={
+                    Text(
+                        "Timestamp Genius needs screen capture and Display over other apps. "+
+                        "Android may also ask for notification permission. "+
+                        "For automatic script scrolling, enable Timestamp Genius in Accessibility settings. "+
+                        "Screen OCR can still work without Accessibility."
+                    )
+                },
+                confirmButton={
+                    TextButton(onClick={
+                        permissionInfo=false
+                        beginPermissionFlow{msg=it}
+                    }){Text("Continue")}
+                },
+                dismissButton={
+                    TextButton(onClick={openAccessibilitySettings}){Text("Accessibility")}
+                }
+            )
         }
 
         if(confirm){
